@@ -74,7 +74,7 @@ void* FctThread(void* p) {
 
         i++;
 
-        nanosleep(2);
+        usleep(2);
     }
 
     printf("\n");
