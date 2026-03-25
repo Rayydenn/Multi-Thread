@@ -69,12 +69,14 @@ void* threadScore(void* p);
 void* threadCases(void* p);
 void* threadNettoyeur(void* p);
 void LiberationCase(void* p);
+void LibererMessage(void* p);
 void HandlerSIGINT(int sig);
 void HandlerSIGUSR1(int sig);
 void HandlerSIGALRM(int sig);
 void setMessage(const char* texte, bool signalOn);
 void RotationPiece(PIECE* pPiece);
 int VerifierPiece();
+int PeutPlacerPiece();
 
 //////////////////////////////////////////////////////////////////
 pthread_mutex_t mutexMessage = PTHREAD_MUTEX_INITIALIZER;
@@ -88,6 +90,17 @@ pthread_cond_t condScore;
 pthread_key_t cle;
 pthread_mutex_t mutexAnalyse;
 pthread_cond_t condAnalyse;
+
+pthread_mutex_t mutexTraitement;
+pthread_cond_t condTraitement;
+
+pthread_mutex_t mutexPiece = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutexFin = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutexTab = PTHREAD_MUTEX_INITIALIZER;
+
+//////////////////////////////////////////////////////////////////
+
+bool traitementEnCours = false;
 
 //////////////////////////////////////////////////////////////////
 
@@ -117,6 +130,12 @@ int nbAnalyses = 0;
 
 int combos = 0;
 int c = 0;
+
+///////////////////////////////////////////////////
+
+bool KO = false;
+
+bool fin = false;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 int main(int argc,char* argv[])
@@ -167,6 +186,15 @@ int main(int argc,char* argv[])
   pthread_mutex_init(&mutexCasesInserees,NULL);
   pthread_cond_init(&condCasesInserees,NULL);
 
+  pthread_mutex_init(&mutexScore, NULL);
+  pthread_cond_init(&condScore,NULL);
+
+  pthread_mutex_init(&mutexAnalyse, NULL);
+  pthread_cond_init(&condAnalyse,NULL);
+
+  pthread_mutex_init(&mutexTraitement, NULL);
+  pthread_cond_init(&condTraitement,NULL);
+
   setMessage("Bienvenue dans Blockudoku ", true);
 
   pthread_create(&thMsg, NULL, threadDefileMessage, NULL);
@@ -189,27 +217,41 @@ int main(int argc,char* argv[])
 
   pthread_create(&thNettoyeur, NULL, threadNettoyeur, NULL);
 
-  // Exemples d'utilisation du module Ressources --> a supprimer
-  //DessineChiffre(1,15,7);
-  //char buffer[40];
-  //sprintf(buffer,"coucou");
-  //for (int i=0 ; i<strlen(buffer) ; i++) DessineLettre(10,2+i,buffer[i]);
-  DessineBrique(7,3,false);
-  DessineBrique(7,5,true);
+  DessineVoyant(8,10, VERT);
 
+  pthread_join(thPiece, NULL);
 
-  printf("(MAIN %p) Attente du clic sur la croix\n",pthread_self());  
-  bool ok = false;
-  while(!ok)
+  // stopper threadEvent
+  pthread_cancel(thEvent);
+  pthread_join(thEvent, NULL);
+
+  // stopper threadCases
+  for (int L = 0; L < 9; L++)
   {
-    event = ReadEvent();
-    if (event.type == CROIX) ok = true;
+    for (int C = 0; C < 9; C++)
+    {
+      pthread_cancel(tabThreadCase[L][C]);
+    }
   }
-  // Fermeture de la fenetre
-  printf("(MAIN %p) Fermeture de la fenetre graphique...",pthread_self()); fflush(stdout);
-  printf("OK\n");
+
+  for (int L = 0; L < 9; L++)
+  {
+    for (int C = 0; C < 9; C++)
+    {
+      pthread_join(tabThreadCase[L][C], NULL);
+    }
+  }
+
+  // stopper thread message
+  pthread_cancel(thMsg);
+  pthread_join(thMsg, NULL);
+
+  // attendre clic croix
+  
 
 
+  FermetureFenetreGraphique();
+  exit(0);
 }
 
 void* threadDefileMessage(void* p)
@@ -219,6 +261,8 @@ void* threadDefileMessage(void* p)
   sigfillset(&mask);
   sigdelset(&mask, SIGALRM);
   pthread_sigmask(SIG_SETMASK, &mask, NULL);
+
+  pthread_cleanup_push(LibererMessage, NULL);
 
   while (1)
   {
@@ -239,15 +283,36 @@ void* threadDefileMessage(void* p)
 
     pthread_mutex_unlock(&mutexMessage);
 
+
     usleep(400000);
   }
+
+  pthread_cleanup_pop(1);
   return NULL;
 }
 
 void* threadPiece(void* p)
 {
+  sigset_t mask;
+  sigfillset(&mask);
+  pthread_sigmask(SIG_SETMASK, &mask, NULL);
+
   while (1)
   {
+    pthread_mutex_lock(&mutexFin);
+    bool f = fin;
+    pthread_mutex_unlock(&mutexFin);
+
+    if (f)
+      pthread_exit(NULL);
+
+    pthread_mutex_lock(&mutexTraitement);
+    while (traitementEnCours)
+      pthread_cond_wait(&condTraitement, &mutexTraitement);
+    pthread_mutex_unlock(&mutexTraitement);
+    PIECE p;
+
+    pthread_mutex_lock(&mutexPiece);
     // 1
     int index = rand() % 12;
     pieceEnCours = pieces[index];
@@ -267,7 +332,28 @@ void* threadPiece(void* p)
     for (int i = 0; i < rot; i++)
       RotationPiece(&pieceEnCours);
 
-    DessinePiece(pieceEnCours);
+    p = pieceEnCours;
+    pthread_mutex_unlock(&mutexPiece);
+
+    DessinePiece(p);
+
+
+    if (!PeutPlacerPiece())
+    {
+      printf("Game Over: Vous n'avez plus de places\n");
+
+      setMessage("GAME OVER ", false);
+
+      pthread_mutex_lock(&mutexFin);
+      KO = true;
+      pthread_mutex_unlock(&mutexFin);
+
+      pthread_mutex_lock(&mutexCasesInserees);
+      pthread_cond_broadcast(&condCasesInserees);
+      pthread_mutex_unlock(&mutexCasesInserees);
+
+      pthread_exit(NULL);
+    }
 
     // 3
 
@@ -275,34 +361,70 @@ void* threadPiece(void* p)
 
     while(!pieceValidee)
     {
+
+      PIECE pieceLocale;
+
+      pthread_mutex_lock(&mutexPiece);
+      pieceLocale = pieceEnCours;
+      pthread_mutex_unlock(&mutexPiece);
+
       pthread_mutex_lock(&mutexCasesInserees);
 
-      while(nbCasesInserees < pieceEnCours.nbCases)
+      while(nbCasesInserees < pieceLocale.nbCases)
+      {
+        pthread_mutex_lock(&mutexFin);
+        bool f2 = fin;
+        pthread_mutex_unlock(&mutexFin);
+
+        if (f2)
+        {
+          pthread_mutex_unlock(&mutexCasesInserees);
+          pthread_exit(NULL);
+        }
         pthread_cond_wait(&condCasesInserees, &mutexCasesInserees);
+      }
 
       // 4
       if (VerifierPiece())
       {
+        pthread_mutex_lock(&mutexTraitement);
+
+        traitementEnCours = true;
+        DessineVoyant(8,10, BLEU);
+
+        pthread_mutex_unlock(&mutexTraitement);
+
         for (int i = 0; i < nbCasesInserees; i++)
         {
           int L = casesInserees[i].ligne;
           int C = casesInserees[i].colonne;
 
+          pthread_mutex_lock(&mutexTab);
           tab[L][C] = BRIQUE;
+          pthread_mutex_unlock(&mutexTab);
           DessineBrique(L, C, false);
-
+          
           pthread_kill(tabThreadCase[L][C], SIGUSR1);
         }
 
+
+        pthread_mutex_lock(&mutexScore);
         for (int i = 0; i < nbCasesInserees; i++)
         {
           score++;
         }
         MAJScore = true;
         pthread_cond_signal(&condScore);
+        pthread_mutex_unlock(&mutexScore);
 
         nbCasesInserees = 0;
         pieceValidee = 1;
+        pthread_mutex_unlock(&mutexCasesInserees);
+
+        pthread_mutex_lock(&mutexTraitement);
+        while(traitementEnCours)
+          pthread_cond_wait(&condTraitement, &mutexTraitement);
+        pthread_mutex_unlock(&mutexTraitement);
       }
       else
       {
@@ -311,14 +433,15 @@ void* threadPiece(void* p)
           int L = casesInserees[i].ligne;
           int C = casesInserees[i].colonne;
 
+          pthread_mutex_lock(&mutexTab);
           tab[L][C] = VIDE;
+          pthread_mutex_unlock(&mutexTab);
           EffaceCarre(L,C);
         }
 
         nbCasesInserees = 0;
+        pthread_mutex_unlock(&mutexCasesInserees);
       }
-
-      pthread_mutex_unlock(&mutexCasesInserees);
     }
 
   }
@@ -328,7 +451,12 @@ void* threadPiece(void* p)
 
 void* threadEvent(void* p)
 {
+  sigset_t mask;
+  sigfillset(&mask);
+  pthread_sigmask(SIG_SETMASK, &mask, NULL);
+
   EVENT_GRILLE_SDL event;
+  struct timespec delay = {0, 400000000};
   while(1)
   {
     event = ReadEvent();
@@ -337,25 +465,52 @@ void* threadEvent(void* p)
     {
       int L = event.ligne;
       int C = event.colonne;
-  
-      if (tab[L][C] == VIDE)
+
+      if (L > 8 || C > 8)
       {
-        DessineDiamant(L,C,ROUGE);
-        tab[L][C] = DIAMANT;
+        DessineVoyant(8, 10, ROUGE);
+        nanosleep(&delay, NULL);
+        
+        pthread_mutex_lock(&mutexTraitement);
+        DessineVoyant(8, 10, traitementEnCours ? BLEU : VERT);
+        pthread_mutex_unlock(&mutexTraitement);
+        continue;
+      }
 
-        pthread_mutex_lock(&mutexCasesInserees);
+      pthread_mutex_lock(&mutexTraitement);
+      bool enCours = traitementEnCours;
+      pthread_mutex_unlock(&mutexTraitement);
 
-        casesInserees[nbCasesInserees].ligne = L;
-        casesInserees[nbCasesInserees].colonne = C;
-        nbCasesInserees++;
+      if (tab[L][C] != VIDE || enCours)
+      {
+        DessineVoyant(8, 10, ROUGE);
+        nanosleep(&delay, NULL);
+        DessineVoyant(8, 10, enCours ? BLEU : VERT);
+        continue;
+      }
 
-        if (nbCasesInserees == pieceEnCours.nbCases)
-        {
-          pthread_cond_signal(&condCasesInserees);
-        }
+      DessineDiamant(L,C,ROUGE);
+      pthread_mutex_lock(&mutexTab);
+      tab[L][C] = DIAMANT;
+      pthread_mutex_unlock(&mutexTab);
 
-        pthread_mutex_unlock(&mutexCasesInserees);
-      }      
+      pthread_mutex_lock(&mutexCasesInserees);
+
+      casesInserees[nbCasesInserees].ligne = L;
+      casesInserees[nbCasesInserees].colonne = C;
+      nbCasesInserees++;
+
+      pthread_mutex_lock(&mutexPiece);
+      int nb = pieceEnCours.nbCases;
+      pthread_mutex_unlock(&mutexPiece);
+
+      if (nbCasesInserees == nb)
+      {
+        pthread_cond_signal(&condCasesInserees);
+      }
+
+      pthread_mutex_unlock(&mutexCasesInserees);
+    
     }
 
     if (event.type == CLIC_DROIT)
@@ -368,7 +523,9 @@ void* threadEvent(void* p)
         int C = casesInserees[i].colonne;
 
         EffaceCarre(L,C);
+        pthread_mutex_lock(&mutexTab);
         tab[L][C] = VIDE;
+        pthread_mutex_unlock(&mutexTab);
       }
 
       nbCasesInserees = 0;
@@ -378,18 +535,21 @@ void* threadEvent(void* p)
 
     if (event.type == CROIX)
     {
-      for (int L = 0; L < 9; L++)
-      {
-        for (int C = 0; C < 9; C++)
-        {
-          pthread_join(tabThreadCase[L][C], NULL);
-        }
-      }
+      pthread_mutex_lock(&mutexFin);
+      fin = true;
+      pthread_mutex_unlock(&mutexFin);
 
+      pthread_mutex_lock(&mutexCasesInserees);
+      pthread_cond_broadcast(&condCasesInserees);
+      pthread_mutex_unlock(&mutexCasesInserees);
+      
+      pthread_mutex_lock(&mutexTraitement);
+      pthread_cond_broadcast(&condTraitement);
+      pthread_mutex_unlock(&mutexTraitement);
 
-      FermetureFenetreGraphique();
-      exit(0);
+      pthread_exit(NULL);
     }
+
   }
 
   return NULL;
@@ -397,6 +557,10 @@ void* threadEvent(void* p)
 
 void* threadScore(void* p)
 {
+  sigset_t mask;
+  sigfillset(&mask);
+  pthread_sigmask(SIG_SETMASK, &mask, NULL);
+
   while (1)
   {
     pthread_mutex_lock(&mutexScore);
@@ -417,15 +581,13 @@ void* threadScore(void* p)
     DessineChiffre(1,16,d3);
     DessineChiffre(1,17,d4);
 
-    int combosLocal = combos;
-    combos = 0;
+    int combosLocal = c;
 
-    c += combosLocal;
 
-    int c1 = c / 1000;
-    int c2 = (c / 100) % 10;
-    int c3 = (c / 10) % 10;
-    int c4 = c % 10;
+    int c1 = combosLocal / 1000;
+    int c2 = (combosLocal / 100) % 10;
+    int c3 = (combosLocal / 10) % 10;
+    int c4 = combosLocal % 10;
 
     DessineChiffre(8,14,c1);
     DessineChiffre(8,15,c2);
@@ -454,6 +616,11 @@ void* threadCases(void* p)
     exit(1);
   }
 
+  sigset_t mask;
+  sigfillset(&mask);
+  sigdelset(&mask, SIGUSR1);
+  pthread_sigmask(SIG_SETMASK, &mask, NULL);
+
   CASE* nouvelleCase = (CASE*) p;
 
 
@@ -469,64 +636,52 @@ void* threadCases(void* p)
 
 void* threadNettoyeur(void* p)
 {
+  sigset_t mask;
+  sigfillset(&mask);
+  pthread_sigmask(SIG_SETMASK, &mask, NULL);
+
   while(1)
   {  
-    pthread_mutex_lock(&mutexAnalyse);
-  
-    int nbcase = pieceEnCours.nbCases;
 
-    while(nbAnalyses < nbcase)
+    pthread_mutex_lock(&mutexAnalyse);
+
+    while(nbAnalyses < pieceEnCours.nbCases)
+    {
       pthread_cond_wait(&condAnalyse, &mutexAnalyse);
-      
+    }
   
     if (nbCarresComplets == 0 && nbLignesCompletes == 0 && nbColonnesCompletes == 0)
     {
       nbAnalyses = 0;
       pthread_mutex_unlock(&mutexAnalyse);
+
+      pthread_mutex_lock(&mutexTraitement);
+      traitementEnCours = false;
+      DessineVoyant(8,10, VERT);
+      pthread_cond_signal(&condTraitement);
+      pthread_mutex_unlock(&mutexTraitement);
+
       continue;
     }
 
-    struct timespec req = {2, 0}, rem;
-    while (nanosleep(&req, &rem) == -1)
-      req = rem;
+    int lignesLocal[9];
+    int colonnesLocal[9];
+    int carresLocal[9];
 
-    for (int i = 0; i < nbLignesCompletes; i++)
-    {
-      int L = lignesCompletes[i];
-      for (int C = 0; C < 9; C++)
-      {
-        tab[L][C] = VIDE;
-        EffaceCarre(L, C);
-      }
-    }
+    int nbLignesLocal = nbLignesCompletes;
+    int nbColonnesLocal = nbColonnesCompletes;
+    int nbCarresLocal = nbCarresComplets;
 
-    for (int i = 0; i < nbColonnesCompletes; i++)
-    {
-      int C = colonnesCompletes[i];
-      for (int L = 0; L < 9; L++)
-      {
-        tab[L][C] = VIDE;
-        EffaceCarre(L, C);
-      }
-    }
+    for (int i = 0; i < nbLignesLocal; i++)
+      lignesLocal[i] = lignesCompletes[i];
 
-    for (int i = 0; i < nbCarresComplets; i++)
-    {
-      int num = carresComplets[i];
-      int Lstart = (num / 3) * 3;
-      int Cstart = (num % 3) * 3;
+    for (int i = 0; i < nbColonnesLocal; i++)
+      colonnesLocal[i] = colonnesCompletes[i];
 
-      for (int L = Lstart; L < Lstart + 3; L++)
-      {
-        for (int C = Cstart; C < Cstart + 3; C++)
-        {
-          tab[L][C] = VIDE;
-          EffaceCarre(L, C);
-        }
-      }
-    }
-  
-    combos = nbLignesCompletes + nbColonnesCompletes + nbCarresComplets;
+    for (int i = 0; i < nbCarresLocal; i++)
+      carresLocal[i] = carresComplets[i];
+
+    int combosLocal = nbLignesLocal + nbColonnesLocal + nbCarresLocal;
 
     nbLignesCompletes = 0;
     nbColonnesCompletes = 0;
@@ -534,23 +689,69 @@ void* threadNettoyeur(void* p)
     nbAnalyses = 0;
 
     pthread_mutex_unlock(&mutexAnalyse);
+
+    struct timespec req = {2, 0}, rem;
+    while (nanosleep(&req, &rem) == -1)
+      req = rem;
+
+    for (int i = 0; i < nbLignesLocal; i++)
+    {
+      int L = lignesLocal[i];
+      for (int C = 0; C < 9; C++)
+      {
+        pthread_mutex_lock(&mutexTab);
+        tab[L][C] = VIDE;
+        pthread_mutex_unlock(&mutexTab);
+        EffaceCarre(L, C);
+      }
+    }
+
+    for (int i = 0; i < nbColonnesLocal; i++)
+    {
+      int C = colonnesLocal[i];
+      for (int L = 0; L < 9; L++)
+      {
+        pthread_mutex_lock(&mutexTab);
+        tab[L][C] = VIDE;
+        pthread_mutex_unlock(&mutexTab);
+        EffaceCarre(L, C);
+      }
+    }
+
+    for (int i = 0; i < nbCarresLocal; i++)
+    {
+      int num = carresLocal[i];
+      int Lstart = (num / 3) * 3;
+      int Cstart = (num % 3) * 3;
+
+      for (int L = Lstart; L < Lstart + 3; L++)
+      {
+        for (int C = Cstart; C < Cstart + 3; C++)
+        {
+          pthread_mutex_lock(&mutexTab);
+          tab[L][C] = VIDE;
+          pthread_mutex_unlock(&mutexTab);
+          EffaceCarre(L, C);
+        }
+      }
+    }
     
     pthread_mutex_lock(&mutexScore);
 
-    int comboscycle = combos;
-    if (comboscycle > 0)
+    if (combosLocal > 0)
     {
-      if (comboscycle == 1)
+      c += combosLocal;
+      if (combosLocal == 1)
       {
         setMessage("Simple Combo ", true);
         score += 10;
       }
-      else if (comboscycle == 2)
+      else if (combosLocal == 2)
       {
         setMessage("Double Combo ", true);
         score += 25;
       }
-      else if (comboscycle == 3)
+      else if (combosLocal == 3)
       {
         setMessage("Triple Combo ", true);
         score += 40;
@@ -560,12 +761,18 @@ void* threadNettoyeur(void* p)
         setMessage("Quadruple Combo ", true);
         score += 55;
       }
-
-      combos = comboscycle;
-      MAJCombos = true;
-      pthread_cond_signal(&condScore);
-      pthread_mutex_unlock(&mutexScore);
     }
+
+    combos = 0;
+    MAJCombos = true;
+    pthread_cond_signal(&condScore);
+    pthread_mutex_unlock(&mutexScore);
+
+    pthread_mutex_lock(&mutexTraitement);
+    traitementEnCours = false;
+    DessineVoyant(8,10, VERT);
+    pthread_cond_signal(&condTraitement);
+    pthread_mutex_unlock(&mutexTraitement);
   }
 
   return NULL;
@@ -635,7 +842,14 @@ void setMessage(const char *texte, bool signalOn)
 
 int VerifierPiece()
 {
-  if (nbCasesInserees != pieceEnCours.nbCases)
+
+  PIECE pieceLocale;
+
+  pthread_mutex_lock(&mutexPiece);
+  pieceLocale = pieceEnCours;
+  pthread_mutex_unlock(&mutexPiece);
+
+  if (nbCasesInserees != pieceLocale.nbCases)
     return 0;
 
   CASE temp[NB_CASES];
@@ -665,8 +879,8 @@ int VerifierPiece()
 
   for (int i = 0; i < nbCasesInserees; i++)
   {
-    if (temp[i].ligne != pieceEnCours.cases[i].ligne ||
-        temp[i].colonne != pieceEnCours.cases[i].colonne)
+    if (temp[i].ligne != pieceLocale.cases[i].ligne ||
+        temp[i].colonne != pieceLocale.cases[i].colonne)
     {
       return 0;
     }
@@ -675,10 +889,59 @@ int VerifierPiece()
   return 1;
 }
 
+int PeutPlacerPiece()
+{
+  PIECE p;
+
+  pthread_mutex_lock(&mutexPiece);
+  p = pieceEnCours;
+  pthread_mutex_unlock(&mutexPiece);
+
+  for (int L = 0; L < 9; L++)
+  {
+    for (int C = 0; C < 9; C++)
+    {
+      int possible = 1;
+
+      for (int i = 0; i < p.nbCases; i++)
+      {
+        int l = L + p.cases[i].ligne;
+        int c = C + p.cases[i].colonne;
+
+        if (l > 8 || c > 8)
+        {
+          possible = 0;
+          break;
+        }
+
+        if (tab[l][c] != VIDE)
+        {
+          possible = 0;
+          break;
+        }
+      }
+
+      if (possible)
+      {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 void LiberationCase(void* p)
 {
   printf("Libération de la case\n");
   free(p);
+}
+
+void LibererMessage(void* p)
+{
+  pthread_mutex_lock(&mutexMessage);
+  if (message != NULL)
+    free(message);
+  pthread_mutex_unlock(&mutexMessage);
 }
 
 void HandlerSIGINT(int sig)
@@ -699,7 +962,6 @@ void HandlerSIGUSR1(int sig)
   int comp = 0;
   bool present = false;
 
-  pthread_mutex_lock(&mutexAnalyse);
   for (int i = 0; i < nbLignesCompletes; i++)
   {
     if (lignesCompletes[i] == Case->ligne)
@@ -789,12 +1051,11 @@ void HandlerSIGUSR1(int sig)
     }
   }
 
+  pthread_mutex_lock(&mutexAnalyse);
   nbAnalyses++;
 
   pthread_cond_signal(&condAnalyse);
   pthread_mutex_unlock(&mutexAnalyse);
-
-
 }
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 /////// Fonctions fournies ////////////////////////////////////////////////////////////////////////
